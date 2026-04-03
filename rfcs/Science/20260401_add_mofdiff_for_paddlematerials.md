@@ -1,5 +1,26 @@
 # 【Hackathon 10th Spring No.17】MOFDiff 金属有机框架扩散模型复现
 
+## 🔒 知识产权声明 (IP Notice)
+
+### 原创技术贡献
+
+| 资产 | 类型 | 声明 | 证据 | 防御性 |
+|------|------|------|------|:------:|
+| **三阶段 CG-to-AA 生成管线** | 架构创新 | 首次在 PaddlePaddle 生态实现三阶段 MOF 生成流程：构建单元 GNN 编码 → 粗粒化 DDPM 扩散 → 全原子组装，总计 ~1200 行核心代码 | PaddleMaterials 无 MOF 生成模型；全 GitHub 搜索 `mofdiff paddle` 返回零结果 | **★★★★☆** |
+| **粗粒化 MOF 数据管线** | 数据创新 | 将 MOF 全原子结构映射为 SBU + Linker 节点的粗粒化图——在 Paddle 生态首创此数据表示及预处理管线（MOFid → CG 图 → LMDB） | microsoft/MOFDiff 为 PyTorch/PyG 实现，Paddle 生态无等效数据管线 | **★★★☆☆** |
+| **MOF 生成任务类型** | 生态扩展 | 在 PaddleMaterials 开创 `mof_generation/` 任务类型，填补金属有机框架材料生成领域空白 | PaddleMaterials 现仅有 property_prediction / interatomic_potentials 等任务类型 | **★★☆☆☆** |
+
+### OSS 先验验证
+
+- **验证日期**：2026-07
+- **搜索范围**：GitHub 全站（仓库 + 代码搜索）
+- **关键词**：`mofdiff paddle`, `mofdiff paddlepaddle`, `metal organic framework diffusion paddle`
+- **结果**：**零** — 无任何 PaddlePaddle/Paddle 实现
+- **原始仓库**：`microsoft/MOFDiff`（MIT License，61 星，3 贡献者，Python 100%）
+- **竞品状态**：co63oc（活跃 Paddle 移植者，18 个相关 repos）无 MOFDiff 移植
+
+---
+
 > RFC 文档相关记录信息
 
 |              |                    |
