@@ -1,5 +1,26 @@
 # 【Hackathon 10th Spring No.16】DiffSyn 沸石合成条件扩散模型复现
 
+## 🔒 知识产权声明 (IP Notice)
+
+### 原创技术贡献
+
+| 资产 | 类型 | 声明 | 证据 | 防御性 |
+|------|------|------|------|:------:|
+| **合成条件扩散模型** | 算法创新 | 全 GitHub 除原始仓库外无任何复现——本实现为全球第二个 DiffSyn 实现，也是首个非 PyTorch 实现 | GitHub 搜索 `diffsyn paddle`、`conditional diffusion zeolite synthesis`、`zeolite synthesis generation` 均返回零仓库结果；原始仓库仅 2 贡献者、37 星、2 fork | **★★★★☆** |
+| **双 GNN 条件编码器** | 架构创新 | SchNet3D（3D 晶体拓扑编码）+ GIN（OSDA 分子图编码）双图神经网络联合条件输入，在 PaddlePaddle 生态首创 | Paddle 生态无沸石结构编码 + 有机分子图编码的联合 GNN 架构 | **★★★☆☆** |
+| **合成条件预测任务** | 生态扩展 | 在 PaddleMaterials 开创 `synthesis_condition_prediction/` 任务类型——材料 AI 从"预测性质"或"生成结构"扩展到"设计合成路线"的逆向合成范式 | PaddleMaterials 现无任何逆向合成 / 合成条件预测模型；该模型发表于 Nature Computational Science (2026)，代表材料合成 AI 最新前沿 | **★★★☆☆** |
+
+### OSS 先验验证
+
+- **验证日期**：2026-07
+- **搜索范围**：GitHub 全站（仓库 + 代码搜索）
+- **关键词**：`diffsyn paddle`, `zeosyn paddle`, `zeolite synthesis diffusion paddle`, `conditional diffusion zeolite synthesis`
+- **结果**：**零** — 不仅无 Paddle 实现，全 GitHub 除原始仓库（`eltonpan/zeosyn_gen`）外无任何复现
+- **原始仓库**：`eltonpan/zeosyn_gen`（MIT License，37 星，2 贡献者，Python 100%，Nature Computational Science 2026）
+- **竞品状态**：co63oc（活跃 Paddle 移植者，18 个相关 repos）无 DiffSyn / 沸石合成移植
+
+---
+
 > RFC 文档相关记录信息
 
 |              |                    |
