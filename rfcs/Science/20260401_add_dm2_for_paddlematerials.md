@@ -296,22 +296,25 @@ Global:
   output_dir: output/dm2_sio2/
 
 Model:
-  type: DM2
-  hidden_channels: 128
-  n_interactions: 5
-  cutoff: 5.0
-  num_species: 2  # Si, O
+  __class_name__: DM2
+  __init_params__:
+    hidden_channels: 128
+    n_interactions: 5
+    cutoff: 5.0
+    num_species: 2  # Si, O
 
 Dataset:
-  type: amorphous
-  data_dir: data/dm2/a-SiO2/
-  cutoff: 5.0
+  __class_name__: amorphous
+  __init_params__:
+    data_dir: data/dm2/a-SiO2/
+    cutoff: 5.0
 
 Optimizer:
-  type: Adam
-  lr: 1.0e-4
-  lr_scheduler: ExponentialDecay
-  gamma: 0.9999
+  __class_name__: Adam
+  __init_params__:
+    lr: 1.0e-4
+    lr_scheduler: ExponentialDecay
+    gamma: 0.9999
 ```
 
 ### 4.6 补充说明
