@@ -276,26 +276,31 @@ Global:
   output_dir: output/mofdiff/
 
 Model:
-  type: MOFDiff
-  bb_encoder:
-    type: GNN
-    hidden_dim: 256
-    n_layers: 4
-  diffusion:
-    type: CDVAE
-    n_steps: 1000
-    beta_schedule: cosine
+  __class_name__: MOFDiff
+  __init_params__:
+    bb_encoder:
+      __class_name__: GNN
+      __init_params__:
+        hidden_dim: 256
+        n_layers: 4
+    diffusion:
+      __class_name__: CDVAE
+      __init_params__:
+        n_steps: 1000
+        beta_schedule: cosine
 
 Dataset:
-  type: bwdb
-  data_dir: data/mofdiff/bwdb_processed/
-  bb_vocab_path: data/mofdiff/bb_vocab.pkl
+  __class_name__: bwdb
+  __init_params__:
+    data_dir: data/mofdiff/bwdb_processed/
+    bb_vocab_path: data/mofdiff/bb_vocab.pkl
 
 Optimizer:
-  type: Adam
-  lr: 1.0e-4
-  lr_scheduler: CosineAnnealing
-  T_max: 500
+  __class_name__: Adam
+  __init_params__:
+    lr: 1.0e-4
+    lr_scheduler: CosineAnnealing
+    T_max: 500
 ```
 
 ### 4.6 补充说明
