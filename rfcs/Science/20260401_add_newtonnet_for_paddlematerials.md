@@ -367,7 +367,7 @@ def build_md(config):
 
 ### 4.4 Trainer 适配
 
-继承 `ppmat/trainer/base_trainer.py`，关键适配点：
+直接使用 `ppmat/trainer/base_trainer.py` 中的 `BaseTrainer`，**不新增自定义训练器文件**，关键适配点：
 
 1. **损失函数**：能量 loss（MSE）+ 力 loss（MSE，权重 100×）
 2. **优化器**：Adam，学习率调度（ReduceLROnPlateau）
@@ -376,22 +376,24 @@ def build_md(config):
 示例配置片段（`molecular_dynamics_potential/configs/newtonnet/newtonnet_md17_ethanol.yaml`）：
 
 ```yaml
-model:
-  type: NewtonNet
-  hidden_dim: 128
-  n_interactions: 6
-  cutoff: 10.0
-  n_rbf: 50
-  max_z: 100
+Model:
+  __class_name__: NewtonNet
+  __init_params__:
+    hidden_dim: 128
+    n_interactions: 6
+    cutoff: 10.0
+    n_rbf: 50
+    max_z: 100
 
-data:
-  type: md
-  dataset_name: md17_ethanol
-  train_path: data/newtonnet/md17_ethanol_train.npz
-  val_path: data/newtonnet/md17_ethanol_val.npz
-  auto_download: true
+Dataset:
+  __class_name__: md
+  __init_params__:
+    dataset_name: md17_ethanol
+    train_path: data/newtonnet/md17_ethanol_train.npz
+    val_path: data/newtonnet/md17_ethanol_val.npz
+    auto_download: true
 
-trainer:
+Trainer:
   max_epochs: 500
   batch_size: 16
   learning_rate: 1.0e-4
