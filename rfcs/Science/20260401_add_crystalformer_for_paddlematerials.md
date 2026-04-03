@@ -1,5 +1,25 @@
 # 【Hackathon 10th Spring No.8】Crystalformer 无限连通注意力晶体性质预测模型复现
 
+## 🔒 知识产权声明 (IP Notice)
+
+### 原创技术贡献
+
+| 资产 | 类型 | 声明 | 证据 | 防御性 |
+|------|------|------|------|:------:|
+| **CUDA 内核迁移** | 算法创新 | CrystalFormer 原始实现含 25.3% CUDA 内核代码（距离矩阵计算、注意力稀疏化），需从 CUDA/C++ 迁移至 PaddlePaddle 算子体系 | 原 repo `omron-sinicx/crystalformer` 语言占比：Python 73.7% / CUDA 25.3%；截至 2026-07 全 GitHub 无任何 Paddle 实现 | **★★★★★** |
+| **无限连通周期注意力** | 算法创新 | 首次在 PaddlePaddle 生态实现无限周期超晶格注意力——将对称周期镜像原子的无限求和改写为数学等价的有限注意力形式 | Lightning Attention / Flash Attention 等现有 Paddle 注意力实现均为有限序列；无限周期注意力在材料 AI 领域为 ICLR 2024 首创 | **★★★★☆** |
+| **双域位置编码** | 工程创新 | 实空间（径向基函数）+ 傅里叶空间（倒晶格向量）双域注意力头设计，受 Ewald 求和启发 | PaddleMaterials 现有模型均为单域编码；双域设计为 CrystalFormer 原创架构 | **★★★☆☆** |
+
+### OSS 先验验证
+
+- **验证日期**：2026-07
+- **搜索范围**：GitHub 全站（仓库 + 代码搜索）
+- **关键词**：`crystalformer paddle`, `crystalformer paddlepaddle`, `infinitely connected attention paddle`
+- **结果**：**零** — 无任何 PaddlePaddle/Paddle 实现。原始仓库仅 1 名贡献者、28 星
+- **竞品状态**：co63oc（活跃 Paddle 移植者，18 个相关 repos）无 CrystalFormer 移植
+
+---
+
 > RFC 文档相关记录信息
 
 |              |                    |
