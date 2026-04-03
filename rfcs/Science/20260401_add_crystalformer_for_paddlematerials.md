@@ -428,26 +428,29 @@ Global:
   output_dir: output/crystalformer_mp_ef/
 
 Model:
-  type: Crystalformer
-  n_layers: 4
-  n_heads: 8
-  hidden_dim: 256
-  alpha_init: 5.0
-  beta_init: 1.0
-  k_max: 6
-  use_fourier_heads: true
+  __class_name__: Crystalformer
+  __init_params__:
+    n_layers: 4
+    n_heads: 8
+    hidden_dim: 256
+    alpha_init: 5.0
+    beta_init: 1.0
+    k_max: 6
+    use_fourier_heads: true
 
 Dataset:
-  type: jarvis
-  data_path: data/crystalformer/megnet_ef/
-  target_name: e_form
+  __class_name__: jarvis
+  __init_params__:
+    data_path: data/crystalformer/megnet_ef/
+    target_name: e_form
 
 Optimizer:
-  type: Adam
-  lr: 1.0e-4
-  weight_decay: 1.0e-5
-  lr_scheduler: CosineAnnealing
-  T_max: 500
+  __class_name__: Adam
+  __init_params__:
+    lr: 1.0e-4
+    weight_decay: 1.0e-5
+    lr_scheduler: CosineAnnealing
+    T_max: 500
 ```
 
 ### 4.6 补充说明
