@@ -307,13 +307,15 @@ def build_polymer(config):
 ```yaml
 # Phase 1: 合成数据监督预训练
 phase1:
-  model:
-    type: TrinityLLM
-    pretrained_weights: data/molformer_pretrained.pdparams  # 转换后的 MoLFormer 权重
-  data:
-    type: polymer
-    data_path: data/trinityllm/synthetic_train.csv
-  trainer:
+  Model:
+    __class_name__: TrinityLLM
+    __init_params__:
+      pretrained_weights: data/molformer_pretrained.pdparams  # 转换后的 MoLFormer 权重
+  Dataset:
+    __class_name__: polymer
+    __init_params__:
+      data_path: data/trinityllm/synthetic_train.csv
+  Trainer:
     max_epochs: 100
     batch_size: 32
     learning_rate: 1.0e-4
@@ -321,13 +323,15 @@ phase1:
 
 # Phase 2: 实验数据微调
 phase2:
-  model:
-    type: TrinityLLM
-    pretrained_weights: checkpoints/phase1/best_model.pdparams  # Phase 1 输出
-  data:
-    type: polymer
-    data_path: data/trinityllm/experimental_train.csv
-  trainer:
+  Model:
+    __class_name__: TrinityLLM
+    __init_params__:
+      pretrained_weights: checkpoints/phase1/best_model.pdparams  # Phase 1 输出
+  Dataset:
+    __class_name__: polymer
+    __init_params__:
+      data_path: data/trinityllm/experimental_train.csv
+  Trainer:
     max_epochs: 200
     batch_size: 16
     learning_rate: 1.0e-5  # 低学习率微调
