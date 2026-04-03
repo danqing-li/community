@@ -324,7 +324,7 @@ def build_polymer(config):
 
 ### 4.4 训练流程
 
-继承 `ppmat/trainer/BaseTrainer`，关键适配点：
+直接使用 `ppmat/trainer/BaseTrainer`，**不新增自定义训练器文件**，关键适配点：
 
 1. **损失函数**：MSE/MAE（回归任务）、16. §CrossEntropyLoss（分类任务）
 2. **优化器**：Adam，学习率 1e-4，Noam 调度器
@@ -339,23 +339,26 @@ Global:
   output_dir: output/wd_mpnn_tg/
 
 Model:
-  type: WDMPNN
-  hidden_dim: 300
-  n_message_passing: 3
-  n_ffn_layers: 2
+  __class_name__: WDMPNN
+  __init_params__:
+    hidden_dim: 300
+    n_message_passing: 3
+    n_ffn_layers: 2
 
 Dataset:
-  type: polymer
-  data_path: data/wd_mpnn/glass_transition_temp.csv
-  target_col: Tg
-  split_ratio: [0.8, 0.1, 0.1]
+  __class_name__: polymer
+  __init_params__:
+    data_path: data/wd_mpnn/glass_transition_temp.csv
+    target_col: Tg
+    split_ratio: [0.8, 0.1, 0.1]
 
 Optimizer:
-  type: Adam
-  lr: 1.0e-4
-  weight_decay: 0.0
-  lr_scheduler: NoamDecay
-  warmup_steps: 2000
+  __class_name__: Adam
+  __init_params__:
+    lr: 1.0e-4
+    weight_decay: 0.0
+    lr_scheduler: NoamDecay
+    warmup_steps: 2000
 ```
 
 ### 4.6 补充说明
