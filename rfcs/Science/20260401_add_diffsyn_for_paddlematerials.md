@@ -327,29 +327,34 @@ Global:
   output_dir: output/diffsyn_zeolite/
 
 Model:
-  type: DiffSyn
-  zeolite_encoder:
-    type: SchNet3D
-    hidden_dim: 256
-  osda_encoder:
-    type: GIN
-    hidden_dim: 256
-  diffusion:
-    n_steps: 1000
-    beta_schedule: linear
-    guidance_weight: 2.0
-    cond_drop_prob: 0.1
+  __class_name__: DiffSyn
+  __init_params__:
+    zeolite_encoder:
+      __class_name__: SchNet3D
+      __init_params__:
+        hidden_dim: 256
+    osda_encoder:
+      __class_name__: GIN
+      __init_params__:
+        hidden_dim: 256
+    diffusion:
+      n_steps: 1000
+      beta_schedule: linear
+      guidance_weight: 2.0
+      cond_drop_prob: 0.1
 
 Dataset:
-  type: zeosyn
-  data_path: data/diffsyn/zeosyn_dataset.pkl
-  zeo_graph_path: data/diffsyn/zeo_graphs.pkl
-  osda_graph_path: data/diffsyn/osda_graphs.pkl
+  __class_name__: zeosyn
+  __init_params__:
+    data_path: data/diffsyn/zeosyn_dataset.pkl
+    zeo_graph_path: data/diffsyn/zeo_graphs.pkl
+    osda_graph_path: data/diffsyn/osda_graphs.pkl
 
 Optimizer:
-  type: Adam
-  lr: 1.0e-4
-  warmup_steps: 1000
+  __class_name__: Adam
+  __init_params__:
+    lr: 1.0e-4
+    warmup_steps: 1000
 ```
 
 ### 4.6 补充说明
