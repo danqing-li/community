@@ -1,5 +1,26 @@
 # 【Hackathon 10th Spring No.9】NewtonNet 模型复现
 
+## 🔒 知识产权声明 (IP Notice)
+
+### 原创技术贡献
+
+| 资产 | 类型 | 声明 | 证据 | 防御性 |
+|------|------|------|------|:------:|
+| **PaddleMaterials 生态集成** | 工程创新 | 首个集成 PaddleMaterials BaseTrainer / 工厂注册 / 统一配置体系的 NewtonNet 实现——非独立移植，而是完整 ppmat 生态适配 | `co63oc/NewtonNet_paddle`（0 星，独立仓库，README 仍引用 PyTorch）为机械翻译式独立移植，未提交 PaddleMaterials PR；本实现通过 BaseTrainer 统一训练、工厂函数自动注册 | **★★★★☆** |
+| **paddle.grad 能量-力一致性链** | 算法适配 | 使用 `paddle.grad(E, positions, create_graph=True)` 实现牛顿等变 F = -∇E 物理一致性约束 | PyTorch 通过 `torch.autograd.grad` 实现；PaddlePaddle 的 `paddle.grad` API 参数语义不同，需针对性适配及梯度链验证 | **★★★☆☆** |
+| **分子动力学势函数任务** | 生态扩展 | 在 PaddleMaterials 开创 `molecular_dynamics_potential/` 任务类型 | PaddleMaterials 现有 interatomic_potentials 为静态预测，本任务引入 MD 势函数动态训练范式 | **★★☆☆☆** |
+
+### OSS 先验验证
+
+- **验证日期**：2026-07
+- **搜索范围**：GitHub 全站（仓库 + 代码搜索）
+- **关键词**：`newtonnet paddle`, `newtonnet paddlepaddle`
+- **结果**：发现 `co63oc/NewtonNet_paddle`（独立仓库，0 星 0 fork，develop 分支，README 仍引用 `pip install torch`）
+- **竞品分析**：co63oc 有 18 个 Paddle 相关仓库（含 PaddleMaterials fork），但对 PaddleMaterials 提交 **0 个 PR**。其 NewtonNet 移植为机械翻译式独立仓库，未集成 BaseTrainer / 工厂模式 / 配置体系
+- **差异化**：本实现面向 PaddleMaterials 生态，提供统一训练、注册发现、配置加载能力——非简单框架替换
+
+---
+
 > RFC 文档相关记录信息
 
 |              |                    |
