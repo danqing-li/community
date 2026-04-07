@@ -189,138 +189,75 @@ PaddleMaterials/
 
 ### 4.2 模型实现
 
-核心模型遵循 PaddleMaterials 统一的 `_forward()`/`forward()`/`predict()` 三层设计：
+核心模型遵循 PaddleMaterials 统一的 `_forward()`/`forward()`/`predict()` 三层设计。
 
-```python
-# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# ...
+#### 数据流
 
-import paddle
-import paddle.nn as nn
-from ppmat.utils.scatter import scatter
+```
+扩展 SMILES "mono1.mono2|s1|s2|<i-j:w_fwd:w_rev..~Xn"
+                       ↓
+              PolymerGraphBuilder
+    （RDKit 解析 → 有向图 + 边权 + Xn）
+                       ↓
+            {atom_features, bond_features,
+             edge_index, edge_weights, Xn}
+                       ↓
+              atom_embed → h₀[N, D]
+                       ↓
+         ┌─────────────────────────┐
+         │ WeightedMessagePassing  │ × T 层（残差连接）
+         │                         │
+         │  m_{u→v} = ReLU(W·h_u + W_b·e_uv)
+         │  h_v' = h_v + Σ_{u→v} w_{u→v} · m_{u→v}
+         │          ↑ 核心创新：有向边权重调制消息
+         └─────────────────────────┘
+                       ↓
+         scatter_sum(batch_index) → mol_repr
+                       ↓
+         mol_repr × (1 + log Xn)  ← 聚合度缩放
+                       ↓
+                 MLP → 属性预测值
+```
 
-class PolymerGraphBuilder:
-    """解析扩展 SMILES，构建加权有向图"""
-    def parse_extended_smiles(self, ext_smiles):
-        """
-        输入: "mono1.mono2|s1|s2|<i-j:w_fwd:w_rev..~Xn"
-        输出: {atom_features, bond_features, edge_index, edge_weights, Xn}
-        """
-        # 1. 分离单体 SMILES、化学计量比、连接权重、Xn
-        # 2. RDKit 解析每个单体片段
-        # 3. 构建有向边（包括单体内键和单体间连接）
-        # 4. 计算边权（单体间连接使用指定权重，单体内键权重=1.0）
-        ...
+#### 关键设计决策
 
-class WeightedMessagePassing(nn.Layer):
-    """加权有向消息传递层"""
-    def __init__(self, hidden_dim=300, bias=True):
-        super().__init__()
-        self.W_msg = nn.Linear(hidden_dim, hidden_dim, bias_attr=bias)
-        self.W_bond = nn.Linear(14, hidden_dim, bias_attr=bias)  # bond feat dim
+1. **有向加权边**：单体间连接权重来自扩展 SMILES 规范，单体内键权重恒为 1.0
+2. **聚合度缩放**：`mol_repr × (1 + log Xn)` 建模聚合物分子量对属性的影响
+3. **消息传递**：`scatter(weighted_messages, target_index, reduce="sum")` 复用 `ppmat.utils.scatter`
 
-    def forward(self, h, bond_features, edge_index, edge_weights):
-        """
-        edge_weights: [n_edges, 1] — 加权有向边的权重
-        """
-        h_src = h[edge_index[0]]  # 源原子表示
-        e_uv = bond_features
-        messages = nn.functional.relu(self.W_msg(h_src) + self.W_bond(e_uv))
-        # 加权聚合：m_v = Σ_u w_{u→v} * m_{u→v}
-        weighted_messages = messages * edge_weights
-        aggregated = scatter(weighted_messages, edge_index[1],
-                            dim=0, dim_size=h.shape[0], reduce="sum")
-        return aggregated
+#### 类签名
 
-class WDMPNN(nn.Layer):
-    """wD-MPNN 主模型，遵循 ppmat 三层模式"""
-    def __init__(self, hidden_dim=300, n_layers=3, dropout=0.1,
-                 atom_fdim=70, bond_fdim=14):
-        super().__init__()
-        self.atom_embed = nn.Linear(atom_fdim, hidden_dim)
-        self.layers = nn.LayerList([
-            WeightedMessagePassing(hidden_dim) for _ in range(n_layers)
-        ])
-        self.readout = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        self.predictor = nn.Linear(hidden_dim, 1)
+```
+WDMPNN(hidden_dim=300, n_layers=3, dropout=0.1, atom_fdim=70, bond_fdim=14)
+  ├─ _forward(batch) → logits: Tensor[n_mols, 1]
+  ├─ forward(batch)  → (loss_dict, pred_dict)     # 训练入口
+  └─ predict(batch)  → {"logits": Tensor}          # 推理入口
 
-    def _forward(self, batch):
-        """纯前向计算"""
-        h = self.atom_embed(batch['atom_features'])
-        for layer in self.layers:
-            h = h + layer(h, batch['bond_features'],
-                         batch['edge_index'], batch['edge_weights'])
-        # Readout: 按分子聚合
-        mol_repr = scatter(h, batch['batch_index'], dim=0,
-                          dim_size=batch['n_mols'], reduce="sum")
-        # 聚合度嵌入：1 + log(Xn)
-        if 'xn' in batch and batch['xn'] is not None:
-            xn_factor = 1.0 + paddle.log(batch['xn']).unsqueeze(-1)
-            mol_repr = mol_repr * xn_factor
-        mol_repr = self.readout(mol_repr)
-        return self.predictor(mol_repr)
+WeightedMessagePassing(hidden_dim)
+  └─ forward(h, bond_features, edge_index, edge_weights) → aggregated
 
-    def forward(self, batch):
-        """训练入口：返回 ppmat 标准 (loss_dict, pred_dict)"""
-        logits = self._forward(batch)
-        pred_dict = {"logits": logits}
-        loss_dict = {}
-        if 'targets' in batch:
-            loss = nn.functional.mse_loss(logits.squeeze(-1), batch['targets'])
-            loss_dict["mse_loss"] = loss
-        return loss_dict, pred_dict
-
-    @paddle.no_grad()
-    def predict(self, batch):
-        """推理入口"""
-        logits = self._forward(batch)
-        return {"logits": logits}
+PolymerGraphBuilder
+  └─ parse_extended_smiles(ext_smiles) → graph_dict
 ```
 
 ### 4.3 数据集适配
 
-```python
-# ppmat/datasets/polymer_dataset.py
-import os
-import numpy as np
-import paddle
-from paddle.io import Dataset
+数据格式：CSV，每行一条高分子记录。关键字段：
 
-class PolymerDataset(Dataset):
-    """高分子属性数据集，支持扩展 SMILES"""
-    def __init__(self, csv_path, featurizer, target_col='target'):
-        import pandas as pd
-        self.df = pd.read_csv(csv_path)
-        self.featurizer = featurizer
-        self.target_col = target_col
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `smiles` | str | 扩展 SMILES（含单体连接权重和 Xn） |
+| `target` | float | 回归目标值（如 Tg、密度等） |
 
-    def __len__(self):
-        return len(self.df)
+工厂函数签名：
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        ext_smiles = row['smiles']  # 扩展 SMILES
-        target = row[self.target_col]
-        graph = self.featurizer.parse_extended_smiles(ext_smiles)
-        graph['targets'] = paddle.to_tensor([target], dtype='float32')
-        return graph
-
-def build_polymer(config):
-    """高分子数据集工厂函数"""
-    featurizer = PolymerGraphBuilder()
-    return PolymerDataset(
-        csv_path=config.data_path,
-        featurizer=featurizer,
-        target_col=config.get('target_col', 'target')
-    )
 ```
+build_polymer(config) → PolymerDataset
+  config.data_path    — CSV 文件路径
+  config.target_col   — 目标列名（默认 'target'）
+```
+
+`PolymerDataset.__getitem__` 通过 `PolymerGraphBuilder.parse_extended_smiles` 将 SMILES 转换为图结构字典。
 
 ### 4.4 训练流程
 
