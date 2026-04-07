@@ -191,146 +191,93 @@ PaddleMaterials/
 
 ### 4.2 模型实现
 
-核心模型遵循 PaddleMaterials 统一的 `_forward()`/`forward()`/`predict()` 三层设计：
+核心模型遵循 PaddleMaterials 统一的 `_forward()`/`forward()`/`predict()` 三层设计。
 
-```python
-# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# ...
+#### 数据流
 
-import paddle
-import paddle.nn as nn
+```
+沸石 3D 拓扑图   OSDA 2D 分子图   合成参数 params[B, P]
+       ↓                ↓
+  ZeoliteEncoder    OsdaEncoder
+  (3D GNN)          (2D GNN)
+       ↓                ↓
+  zeo_emb[B, D]    osda_emb[B, D]
+       └──────┬─────────┘
+              ↓
+     cond = concat(zeo_emb, osda_emb)
+              ↓
+  ┌──────────────────────────────┐
+  │  训练阶段（条件扩散 + CFG）    │
+  │                              │
+  │  t ~ Uniform(0, T)          │
+  │  noise ~ N(0, I)            │
+  │  params_noisy = add_noise(params, noise, t)
+  │                              │
+  │  Classifier-free dropout:    │
+  │    mask ~ Bernoulli(1-p)     │
+  │    cond = cond * mask        │ ← 以概率 p 丢弃条件
+  │                              │
+  │  pred_noise = MLP(params_noisy ⊕ cond ⊕ t)
+  │  loss = MSE(pred_noise, noise)
+  └──────────────────────────────┘
 
-class ZeoliteEncoder(nn.Layer):
-    """沸石 3D 拓扑图 GNN 编码器"""
-    def __init__(self, node_fdim, hidden_dim=128, n_layers=4):
-        super().__init__()
-        # 3D 图消息传递（参考 DimeNet++ 的距离嵌入逻辑）
-        ...
+  ┌──────────────────────────────┐
+  │  推理阶段（CFG 引导采样）      │
+  │                              │
+  │  params₀ ~ N(0, I)          │
+  │  for t = T..1:              │
+  │    ε_cond = MLP(params_t, cond, t)
+  │    ε_uncond = MLP(params_t, 0, t)
+  │    ε = ε_uncond + w·(ε_cond - ε_uncond)  ← CFG
+  │    params_{t-1} = denoise_step(params_t, ε, t)
+  └──────────────────────────────┘
+              ↓
+     生成的合成参数 params_final[B, P]
+```
 
-    def forward(self, zeo_graph):
-        """沸石图 → 向量表示"""
-        ...
+#### 关键设计决策
 
-class OsdaEncoder(nn.Layer):
-    """OSDA 2D 分子图 GNN 编码器"""
-    def __init__(self, atom_fdim, hidden_dim=128, n_layers=3):
-        super().__init__()
-        ...
+1. **Classifier-Free Guidance (CFG)**：训练时以概率 `cond_drop_prob` 随机 drop 条件向量，推理时用 `w·(有条件-无条件)` 引导
+2. **双编码器架构**：沸石（3D 拓扑）和 OSDA（2D 分子）各自独立编码，拼接后作为条件
+3. **MLP 去噪器**：合成参数为连续低维向量（非图结构），MLP 足够建模，无需 GNN
+4. **参考 ppmat 已有 GNN**：ZeoliteEncoder 复用 SchNet/DimeNet++ 组件，不迁移原始自定义 GNN
 
-    def forward(self, osda_graph):
-        """OSDA 分子图 → 向量表示"""
-        ...
+#### 类签名
 
-class DiffSyn(nn.Layer):
-    """DiffSyn 条件扩散模型，遵循 ppmat 三层模式"""
-    def __init__(self, zeo_encoder, osda_encoder, param_dim,
-                 hidden_dim=256, n_steps=1000, cond_drop_prob=0.1):
-        super().__init__()
-        self.zeo_encoder = zeo_encoder
-        self.osda_encoder = osda_encoder
-        self.cond_drop_prob = cond_drop_prob
-        self.n_steps = n_steps
+```
+DiffSyn(zeo_encoder, osda_encoder, param_dim, hidden_dim=256,
+        n_steps=1000, cond_drop_prob=0.1)
+  ├─ _forward(noisy_params, t, zeo_emb, osda_emb) → pred_noise: Tensor[B, P]
+  ├─ forward(batch)  → (loss_dict, pred_dict)        # 训练入口
+  └─ predict(batch, cond_scale=0.75)
+        → {"synthesis_params": Tensor[B, P]}
 
-        # MLP denoiser for synthesis parameters
-        cond_dim = zeo_encoder.output_dim + osda_encoder.output_dim
-        self.denoiser = nn.Sequential(
-            nn.Linear(param_dim + cond_dim + 1, hidden_dim),  # +1 for timestep
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, param_dim),
-        )
+ZeoliteEncoder(node_fdim, hidden_dim=128, n_layers=4)
+  └─ forward(zeo_graph) → zeo_emb: Tensor[B, D]
 
-    def _forward(self, noisy_params, t, zeo_emb, osda_emb):
-        """纯前向：预测噪声"""
-        cond = paddle.concat([zeo_emb, osda_emb], axis=-1)
-        x = paddle.concat([noisy_params, cond, t.unsqueeze(-1)], axis=-1)
-        return self.denoiser(x)
-
-    def forward(self, batch):
-        """训练入口：条件扩散 + classifier-free dropout"""
-        zeo_emb = self.zeo_encoder(batch['zeo_graph'])
-        osda_emb = self.osda_encoder(batch['osda_graph'])
-
-        # Classifier-free guidance: 随机 drop 条件
-        if self.training:
-            mask = paddle.rand([zeo_emb.shape[0], 1]) > self.cond_drop_prob
-            zeo_emb = zeo_emb * mask.astype('float32')
-            osda_emb = osda_emb * mask.astype('float32')
-
-        params = batch['synthesis_params']  # 真实合成参数
-        # 采样时间步和噪声
-        t = paddle.randint(0, self.n_steps, [params.shape[0]])
-        noise = paddle.randn_like(params)
-        # 添加噪声
-        noisy_params = self._add_noise(params, noise, t)
-        # 预测噪声
-        pred_noise = self._forward(noisy_params, t.astype('float32'), zeo_emb, osda_emb)
-
-        loss = nn.functional.mse_loss(pred_noise, noise)
-        return {"diffusion_loss": loss}, {"pred_noise": pred_noise}
-
-    @paddle.no_grad()
-    def predict(self, batch, cond_scale=0.75):
-        """推理入口：classifier-free guidance 采样"""
-        zeo_emb = self.zeo_encoder(batch['zeo_graph'])
-        osda_emb = self.osda_encoder(batch['osda_graph'])
-
-        params = paddle.randn([zeo_emb.shape[0], self.param_dim])
-        for t in reversed(range(self.n_steps)):
-            t_tensor = paddle.full([params.shape[0]], t, dtype='float32')
-            # 有条件预测
-            pred_cond = self._forward(params, t_tensor, zeo_emb, osda_emb)
-            # 无条件预测
-            pred_uncond = self._forward(params, t_tensor,
-                                       paddle.zeros_like(zeo_emb),
-                                       paddle.zeros_like(osda_emb))
-            # Classifier-free guidance
-            pred = pred_uncond + cond_scale * (pred_cond - pred_uncond)
-            params = self._denoise_step(params, pred, t)
-
-        return {"synthesis_params": params}
+OsdaEncoder(atom_fdim, hidden_dim=128, n_layers=3)
+  └─ forward(osda_graph) → osda_emb: Tensor[B, D]
 ```
 
 ### 4.3 数据集适配
 
-```python
-# ppmat/datasets/zeosyn_dataset.py
-import pickle
-import paddle
-from paddle.io import Dataset
+数据源：ZeoSyn 沸石合成数据集（`.pkl` 格式，预处理后的图结构）。
 
-class ZeoSynDataset(Dataset):
-    """ZeoSyn 沸石合成数据集"""
-    def __init__(self, data_path, zeo_graph_path, osda_graph_path, split='train'):
-        with open(data_path, 'rb') as f:
-            self.data = pickle.load(f)
-        with open(zeo_graph_path, 'rb') as f:
-            self.zeo_graphs = pickle.load(f)
-        with open(osda_graph_path, 'rb') as f:
-            self.osda_graphs = pickle.load(f)
+每条数据包含：
 
-    def __len__(self):
-        return len(self.data)
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `zeo_graph` | Graph | 沸石 3D 拓扑结构（按 zeolite_code 查表） |
+| `osda_graph` | Graph | OSDA 2D 分子图（按 SMILES 查表） |
+| `synthesis_params` | float32[P] | 合成条件参数向量 |
 
-    def __getitem__(self, idx):
-        entry = self.data[idx]
-        return {
-            'zeo_graph': self.zeo_graphs[entry['zeolite_code']],
-            'osda_graph': self.osda_graphs[entry['osda_smiles']],
-            'synthesis_params': paddle.to_tensor(entry['params'], dtype='float32'),
-        }
+工厂函数签名：
 
-def build_zeosyn(config):
-    """ZeoSyn 数据集工厂函数"""
-    return ZeoSynDataset(
-        data_path=config.data_path,
-        zeo_graph_path=config.zeo_graph_path,
-        osda_graph_path=config.osda_graph_path,
-        split=config.get('split', 'train')
-    )
+```
+build_zeosyn(config) → ZeoSynDataset
+  config.data_path       — 合成记录 pkl 路径
+  config.zeo_graph_path  — 沸石图缓存 pkl 路径
+  config.osda_graph_path — OSDA 图缓存 pkl 路径
 ```
 
 ### 4.4 训练流程
