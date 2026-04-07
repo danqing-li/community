@@ -192,198 +192,76 @@ PaddleMaterials/
 
 ### 4.2 模型实现
 
-核心模型类遵循 PaddleMaterials 统一的 `_forward()`/`forward()`/`predict()` 三层设计。关键代码骨架如下：
+核心模型遵循 PaddleMaterials 统一的 `_forward()`/`forward()`/`predict()` 三层设计。
 
-```python
-# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# ...
+#### 数据流
 
-import paddle
-import paddle.nn as nn
-from ppmat.utils.scatter import scatter
-
-class NewtonNetInteraction(nn.Layer):
-    """牛顿等变消息传递层"""
-    def __init__(self, hidden_dim=128, cutoff=10.0, n_rbf=50):
-        super().__init__()
-        self.cutoff = cutoff
-        self.distance_expansion = GaussianRBF(n_rbf, cutoff)
-        
-        # 消息网络
-        self.message_net = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + n_rbf, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU()
-        )
-        
-        # 力场投影（径向分量）
-        self.force_proj = nn.Linear(hidden_dim, 1, bias_attr=False)
-        
-    def forward(self, atom_features, positions, edge_index, edge_vectors):
-        """
-        positions: [n_atoms, 3] 原子坐标
-        edge_vectors: [n_edges, 3] 边向量（j - i）
-        返回：原子力 [n_atoms, 3]
-        """
-        n_atoms = atom_features.shape[0]
-        n_edges = edge_index.shape[1]
-        
-        # 距离计算
-        distances = paddle.norm(edge_vectors, axis=-1)
-        
-        # 距离嵌入（RBF 展开）
-        rbf = self.distance_expansion(distances)
-        
-        # 消息生成：m_{ij} = f(h_i, h_j, r_ij, d_ij)
-        h_i = atom_features[edge_index[0]]
-        h_j = atom_features[edge_index[1]]
-        messages = self.message_net(paddle.concat([h_i, h_j, rbf], axis=-1))
-        
-        # 力场分解：F_ij = force_proj(m_{ij}) * d_ij（径向分量）
-        force_magnitude = self.force_proj(messages)  # [n_edges, 1]
-        edge_directions = edge_vectors / (distances.unsqueeze(-1) + 1e-8)
-        pairwise_forces = force_magnitude * edge_directions  # [n_edges, 3]
-        
-        # 牛顿第三定律：F_ji = -F_ij（自动满足，通过 scatter 聚合）
-        # 原子力：F_i = Σ_{j→i} F_ji - Σ_{i→j} F_ij
-        forces = scatter(pairwise_forces, edge_index[1], dim=0, dim_size=n_atoms, reduce="sum")
-        forces -= scatter(pairwise_forces, edge_index[0], dim=0, dim_size=n_atoms, reduce="sum")
-        
-        return forces
-
-class NewtonNet(nn.Layer):
-    """NewtonNet 主模型，遵循 ppmat 的 _forward/forward/predict 三层模式"""
-    def __init__(self, hidden_dim=128, n_interactions=6, cutoff=10.0,
-                 n_rbf=50, max_z=100):
-        super().__init__()
-        self.embedding = nn.Embedding(max_z, hidden_dim, padding_idx=0)
-        self.interactions = nn.LayerList([
-            NewtonNetInteraction(hidden_dim, cutoff, n_rbf) 
-            for _ in range(n_interactions)
-        ])
-        self.energy_head = nn.Linear(hidden_dim, 1)
-        
-    def _forward(self, atom_types, positions, edge_index, batch_index):
-        """纯前向计算，返回原子能量"""
-        # 原子嵌入
-        h = self.embedding(atom_types)
-        
-        # 边向量计算
-        edge_vectors = positions[edge_index[1]] - positions[edge_index[0]]
-        
-        # T 层牛顿等变相互作用
-        for interaction in self.interactions:
-            h = h + interaction(h, positions, edge_index, edge_vectors)
-        
-        # 原子能量预测
-        atomic_energies = self.energy_head(h).squeeze(-1)
-        return atomic_energies
-    
-    def forward(self, atom_types, positions, edge_index, batch_index, 
-                targets_energy=None, targets_force=None):
-        """
-        训练入口，返回 (loss_dict, pred_dict)
-        力通过能量梯度自动计算：F = -∇E
-        """
-        # 启用梯度以计算力
-        positions.stop_gradient = False
-        
-        # 能量计算
-        atomic_energies = self._forward(atom_types, positions, edge_index, batch_index)
-        
-        # 总能量（按分子 scatter sum）
-        total_energy = scatter(atomic_energies, batch_index, dim=0, 
-                               dim_size=batch_index.max()+1, reduce="sum")
-        
-        # 力 = -∇E（自动微分，确保能量 - 力一致性）
-        grad_outputs = paddle.ones_like(total_energy)
-        forces = -paddle.grad(total_energy, positions, grad_outputs=grad_outputs)[0]
-        
-        pred_dict = {"energy": total_energy, "force": forces}
-        loss_dict = {}
-        
-        if targets_energy is not None:
-            energy_loss = nn.functional.mse_loss(total_energy, targets_energy)
-            loss_dict["energy_loss"] = energy_loss
-        
-        if targets_force is not None:
-            force_loss = nn.functional.mse_loss(forces, targets_force)
-            loss_dict["force_loss"] = force_loss
-        
-        if loss_dict:
-            # 加权总 loss（默认 energy:force = 1:100）
-            loss_dict["total_loss"] = loss_dict.get("energy_loss", 0) + \
-                                      100 * loss_dict.get("force_loss", 0)
-        
-        return loss_dict, pred_dict
-    
-    def predict(self, atom_types, positions, edge_index, batch_index):
-        """推理入口"""
-        atomic_energies = self._forward(atom_types, positions, edge_index, batch_index)
-        total_energy = scatter(atomic_energies, batch_index, dim=0,
-                               dim_size=batch_index.max()+1, reduce="sum")
-        
-        positions.stop_gradient = False
-        grad_outputs = paddle.ones_like(total_energy)
-        forces = -paddle.grad(total_energy, positions, grad_outputs=grad_outputs)[0]
-        
-        return {"energy": total_energy, "force": forces}
+```
+原子序数 Z[N] + 坐标 pos[N, 3] + 邻居列表 edge_index[2, E]
+                       ↓
+              Embedding(Z) → h₀[N, D]
+              edge_vectors = pos[j] - pos[i]
+                       ↓
+         ┌─────────────────────────────┐
+         │  NewtonNetInteraction       │ × T 层（残差连接）
+         │                             │
+         │  distances = ‖edge_vectors‖
+         │  rbf = GaussianRBF(distances)
+         │  m_ij = MLP(h_i ⊕ h_j ⊕ rbf)
+         │  F_ij = force_proj(m_ij) · d̂_ij    ← 径向力分解
+         │                                      ↑ 核心创新
+         │  F_i = Σ_{j→i} F_ji - Σ_{i→j} F_ij  ← 牛顿第三定律
+         └─────────────────────────────┘
+                       ↓
+              energy_head(h_T) → E_atom[N]
+              scatter_sum(batch_index) → E_total
+                       ↓
+              F = -∇_pos E_total          ← 能量-力一致性
+                  (paddle.grad 自动微分)
 ```
 
-**设计要点**：
-1. **ppmat 三层模式**：`_forward()` 纯计算 → `forward()` 返回 `(loss_dict, pred_dict)` → `predict()` 推理入口
-2. **牛顿第三定律**：通过 `F_i = Σ_{j→i} F_ji - Σ_{i→j} F_ij` 确保自动满足 F_ij = -F_ji
-3. **能量 - 力一致性**：力通过 `paddle.grad` 从能量计算，确保物理一致性
-4. **scatter 聚合**：复用 `ppmat.utils.scatter` 进行邻居聚合，与 SchNet/DimeNet++ 一致
-5. **力场加权**：force_loss 权重 100× energy_loss（原论文经验值）
+#### 关键设计决策
+
+1. **牛顿第三定律**：`F_i = Σ_{j→i} F_ji - Σ_{i→j} F_ij` 确保 `F_ij = -F_ji` 自动满足
+2. **能量-力一致性**：力通过 `paddle.grad(E, positions)` 从能量保守场计算，符合物理约束
+3. **力场加权**：`total_loss = energy_loss + 100 × force_loss`（原论文经验值）
+4. **消息聚合**：复用 `ppmat.utils.scatter`，与 SchNet/DimeNet++ 一致
+
+#### 类签名
+
+```
+NewtonNet(hidden_dim=128, n_interactions=6, cutoff=10.0, n_rbf=50, max_z=100)
+  ├─ _forward(atom_types, positions, edge_index, batch_index) → E_atom: Tensor[N]
+  ├─ forward(atom_types, positions, edge_index, batch_index, targets_energy, targets_force)
+  │     → (loss_dict, pred_dict)        # 训练入口
+  └─ predict(atom_types, positions, edge_index, batch_index)
+        → {"energy": Tensor, "force": Tensor[N, 3]}
+
+NewtonNetInteraction(hidden_dim, cutoff, n_rbf)
+  └─ forward(atom_features, positions, edge_index, edge_vectors) → forces: Tensor[N, 3]
+```
 
 ### 4.3 数据集适配
 
-```python
-# ppmat/datasets/md_dataset.py
-# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-import os
-import numpy as np
-import paddle
-from paddle.io import Dataset
-from ppmat.utils.download import download_url
+数据源：MD17 / SPICE 等分子动力学轨迹数据集（`.npz` 格式，从 BCS 自动下载）。
 
-class MDDataset(Dataset):
-    """分子动力学数据集，支持 MD17、SPICE 等"""
-    def __init__(self, data_path, dataset_name='md17_ethanol', split='train', auto_download=True):
-        if auto_download and not os.path.exists(data_path):
-            self._download(data_path, dataset_name, split)
-        self.data = np.load(data_path, allow_pickle=True).item()
-        
-    def _download(self, data_path, dataset_name, split):
-        """从 BCS 自动下载预处理数据文件"""
-        os.makedirs(os.path.dirname(data_path), exist_ok=True)
-        url = f"https://paddle-org.bj.bcebos.com/paddlematerials/datasets/newtonnet/{dataset_name}_{split}.npz"
-        download_url(url, os.path.dirname(data_path))
-    
-    def __len__(self):
-        return len(self.data['atom_types'])
-    
-    def __getitem__(self, idx):
-        return {
-            'atom_types': paddle.to_tensor(self.data['atom_types'][idx], dtype='int64'),
-            'positions': paddle.to_tensor(self.data['positions'][idx], dtype='float32'),
-            'edge_index': paddle.to_tensor(self.data['edge_index'][idx], dtype='int64'),
-            'energy': paddle.to_tensor(self.data['energies'][idx], dtype='float32'),
-            'force': paddle.to_tensor(self.data['forces'][idx], dtype='float32')
-        }
+每条数据包含：
 
-def build_md(config):
-    """分子动力学数据集工厂函数，注册到 ppmat/datasets/__init__.py"""
-    return MDDataset(
-        data_path=config.data_path,
-        dataset_name=config.get('dataset_name', 'md17_ethanol'),
-        split=config.get('split', 'train'),
-        auto_download=config.get('auto_download', True)
-    )
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `atom_types` | int64[N] | 原子序数 |
+| `positions` | float32[N, 3] | 笛卡尔坐标 (Å) |
+| `edge_index` | int64[2, E] | 邻居列表 |
+| `energy` | float32 | 总能量 (eV) |
+| `force` | float32[N, 3] | 原子力 (eV/Å) |
+
+工厂函数签名：
+
+```
+build_md(config) → MDDataset
+  config.data_path      — .npz 文件路径
+  config.dataset_name   — 数据集名（如 'md17_ethanol'）
+  config.auto_download  — 是否自动从 BCS 下载
 ```
 
 ### 4.4 Trainer 适配
