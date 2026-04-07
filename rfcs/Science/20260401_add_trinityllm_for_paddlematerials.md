@@ -177,130 +177,78 @@ PaddleMaterials/
 
 ### 4.2 模型实现
 
-核心模型遵循 PaddleMaterials 统一的 `_forward()`/`forward()`/`predict()` 三层设计：
+核心模型遵循 PaddleMaterials 统一的 `_forward()`/`forward()`/`predict()` 三层设计。
 
-```python
-# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# ...
+#### 数据流
 
-import paddle
-import paddle.nn as nn
+```
+SMILES 字符串
+          ↓
+    SmilesTokenizer
+          ↓
+  input_ids[B, L] + attention_mask[B, L]
+          ↓
+  ┌─────────────────────────────┐
+  │    MoLFormerEncoder          │
+  │                             │
+  │  token_embed + pos_embed    │
+  │          ↓                  │
+  │  TransformerEncoderLayer    │ × 12 层
+  │  (线性注意力, GELU FFN)      │
+  │          ↓                  │
+  │  LayerNorm → [CLS] 池化     │
+  └─────────────────────────────┘
+          ↓
+    mol_repr[B, D]
+          ↓
+  ┌─────────────────────────────┐
+  │  prediction_head (MLP)      │
+  │  D → D/2 → SiLU → n_tasks  │
+  └─────────────────────────────┘
+          ↓
+    属性预测值[B, n_tasks]
+```
 
-class MoLFormerEncoder(nn.Layer):
-    """MoLFormer 线性注意力编码器"""
-    def __init__(self, vocab_size=2362, hidden_dim=768, n_layers=12,
-                 n_heads=12, max_seq_len=211, dropout=0.1):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.pos_embedding = nn.Embedding(max_seq_len, hidden_dim)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=n_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            activation='gelu'
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.norm = nn.LayerNorm(hidden_dim)
+#### 关键设计决策
 
-    def forward(self, input_ids, attention_mask=None):
-        seq_len = input_ids.shape[1]
-        positions = paddle.arange(seq_len).unsqueeze(0)
-        x = self.embedding(input_ids) + self.pos_embedding(positions)
-        if attention_mask is not None:
-            src_key_padding_mask = (attention_mask == 0)
-        else:
-            src_key_padding_mask = None
-        x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
-        x = self.norm(x)
-        # 取 [CLS] token 或 mean pooling
-        return x[:, 0, :]  # [batch, hidden_dim]
+1. **两阶段训练**：Phase 1 用合成数据监督预训练，Phase 2 用少量实验数据微调——核心创新在于合成数据的利用
+2. **MoLFormer 编码器**：基于 Transformer 的 SMILES 序列编码（非 GNN），复用 MoLFormer 预训练权重
+3. **[CLS] 池化**：取序列第一个 token 的隐状态作为分子整体表征
 
+#### 类签名
 
-class TrinityLLM(nn.Layer):
-    """TrinityLLM 主模型，遵循 ppmat 的 _forward/forward/predict 三层模式"""
-    def __init__(self, vocab_size=2362, hidden_dim=768, n_layers=12,
-                 n_heads=12, max_seq_len=211, n_tasks=1, dropout=0.1):
-        super().__init__()
-        self.encoder = MoLFormerEncoder(
-            vocab_size, hidden_dim, n_layers, n_heads, max_seq_len, dropout
-        )
-        # 属性预测头
-        self.prediction_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, n_tasks)
-        )
+```
+TrinityLLM(vocab_size=2362, hidden_dim=768, n_layers=12,
+           n_heads=12, max_seq_len=211, n_tasks=1)
+  ├─ _forward(input_ids, attention_mask) → predictions: Tensor[B, n_tasks]
+  ├─ forward(input_ids, attention_mask, targets)
+  │     → (loss_dict, pred_dict)       # 训练入口
+  └─ predict(input_ids, attention_mask)
+        → {"predictions": Tensor}
 
-    def _forward(self, input_ids, attention_mask=None):
-        """纯前向计算，返回属性预测值"""
-        mol_repr = self.encoder(input_ids, attention_mask)
-        predictions = self.prediction_head(mol_repr)
-        return predictions
-
-    def forward(self, input_ids, attention_mask=None, targets=None):
-        """训练入口，返回 (loss_dict, pred_dict)"""
-        predictions = self._forward(input_ids, attention_mask)
-        pred_dict = {"predictions": predictions}
-        loss_dict = {}
-
-        if targets is not None:
-            loss = nn.functional.mse_loss(predictions.squeeze(-1), targets)
-            loss_dict["mse_loss"] = loss
-
-        return loss_dict, pred_dict
-
-    def predict(self, input_ids, attention_mask=None):
-        """推理入口"""
-        predictions = self._forward(input_ids, attention_mask)
-        return {"predictions": predictions}
+MoLFormerEncoder(vocab_size, hidden_dim, n_layers, n_heads, max_seq_len)
+  └─ forward(input_ids, attention_mask) → mol_repr: Tensor[B, D]
 ```
 
 ### 4.3 数据集适配
 
-```python
-# ppmat/datasets/polymer_dataset.py
-import os
-import pandas as pd
-import paddle
-from paddle.io import Dataset
+数据格式：CSV，每行一条高分子记录。通过 `SmilesTokenizer` 将 SMILES 转为 token 序列。
 
-class PolymerDataset(Dataset):
-    """高分子属性数据集，支持 TrinityLLM 两阶段训练"""
-    def __init__(self, data_path, tokenizer, max_length=211, split='train'):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        df = pd.read_csv(data_path)
-        self.smiles = df['smiles'].tolist()
-        self.targets = df['target'].values if 'target' in df.columns else None
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `smiles` | str | 分子 SMILES 字符串 |
+| `target` | float | 回归目标值 |
 
-    def __len__(self):
-        return len(self.smiles)
+工厂函数签名：
 
-    def __getitem__(self, idx):
-        tokens = self.tokenizer.encode(self.smiles[idx], max_length=self.max_length)
-        item = {
-            'input_ids': paddle.to_tensor(tokens['input_ids'], dtype='int64'),
-            'attention_mask': paddle.to_tensor(tokens['attention_mask'], dtype='int64')
-        }
-        if self.targets is not None:
-            item['target'] = paddle.to_tensor(self.targets[idx], dtype='float32')
-        return item
-
-def build_polymer(config):
-    """高分子数据集工厂函数，注册到 ppmat/datasets/__init__.py"""
-    from ppmat.models.trinityllm.smiles_tokenizer import SmilesTokenizer
-    tokenizer = SmilesTokenizer(vocab_file=config.get('vocab_file'))
-    return PolymerDataset(
-        data_path=config.data_path,
-        tokenizer=tokenizer,
-        max_length=config.get('max_length', 211),
-        split=config.get('split', 'train')
-    )
 ```
+build_polymer(config) → PolymerDataset
+  config.data_path   — CSV 文件路径
+  config.vocab_file  — 词表文件路径
+  config.max_length  — 最大序列长度（默认 211）
+```
+
+`SmilesTokenizer` 基于自定义词表将 SMILES 编码为 `input_ids` + `attention_mask`。
 
 ### 4.4 两阶段训练适配
 
