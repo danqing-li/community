@@ -217,227 +217,95 @@ PaddleMaterials/
 
 ### 4.2 模型实现
 
-核心模型遵循 PaddleMaterials 统一的 `_forward()`/`forward()`/`predict()` 三层设计：
+核心模型遵循 PaddleMaterials 统一的 `_forward()`/`forward()`/`predict()` 三层设计。
 
-```python
-# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# ...
+#### 数据流
 
-import paddle
-import paddle.nn as nn
+```
+原子序列 Z[B, N] + 晶格矩阵 L[B, 3, 3]
+                       ↓
+         ┌──────────────────────────┐
+         │  周期位置编码（核心创新）     │
+         │                          │
+         │  α̃_ij = log Σ_n exp(-‖p_j + Ln - p_i‖² / 2r₀²)
+         │        伪有限注意力：对所有周期镜像高斯衰减求和
+         │  β̃_ij = Σ_n RBF(‖p_j + Ln - p_i‖) · exp(...)
+         │        值向量位置编码（RBF）
+         └──────────────────────────┘
+                       ↓
+              α_pe[B, H, N, N]  +  β_pe[B, H, N, N, K]
+                       ↓
+              Embedding(Z) → x[B, N, D]
+                       ↓
+         ┌──────────────────────────┐
+         │  InfiniteAttentionBlock  │ × L 层
+         │                          │
+         │  attn = softmax(QK^T/√d + α_pe)   ← 伪有限周期注意力
+         │  out  = attn · (V + RBF_proj(β_pe))← 周期值编码
+         │  x = x + FFN(LayerNorm(out))
+         └──────────────────────────┘
+                       ↓
+         mean_pool(mask) → MLP → 属性预测值
+```
 
-class InfiniteAttentionBlock(nn.Layer):
-    """无限连通自注意力 + FFN（单层）"""
-    def __init__(self, model_dim, head_num, ff_dim, scale_real,
-                 gauss_lb_real, value_pe_dist_real, domain='real'):
-        super().__init__()
-        self.head_num = head_num
-        self.head_dim = model_dim // head_num
-        self.domain = domain
+#### 关键设计决策
 
-        # QKV 投影
-        self.w_q = nn.Linear(model_dim, model_dim, bias_attr=False)
-        self.w_k = nn.Linear(model_dim, model_dim, bias_attr=False)
-        self.w_v = nn.Linear(model_dim, model_dim, bias_attr=False)
-        self.w_o = nn.Linear(model_dim, model_dim)
+1. **无限连通注意力**：通过对所有晶格平移向量 `Ln` 的高斯衰减求和，实现无截断半径的全局交互
+2. **伪有限近似**：实空间截断 + 倒格矢 Ewald 求和，保证数值收敛
+3. **α / β 双编码**：α 编码入注意力权重（哪些原子对重要），β 编码入值向量（方向信息）
 
-        # 高斯距离衰减参数
-        self.scale_real = scale_real
-        self.gauss_lb_real = gauss_lb_real
+#### 类签名
 
-        # 值向量位置编码（RBF）
-        self.value_pe_dist_real = value_pe_dist_real
-        if value_pe_dist_real > 0:
-            self.rbf_proj = nn.Linear(value_pe_dist_real, self.head_dim)
+```
+Crystalformer(atom_types=118, model_dim=128, num_layers=4, head_num=8, ...)
+  ├─ _forward(atom_types, alpha_pe, beta_pe, mask) → pred: Tensor[B]
+  ├─ forward(batch)  → (loss_dict, pred_dict)
+  └─ predict(batch)  → {"pred": Tensor}
 
-        # FFN
-        self.ffn = nn.Sequential(
-            nn.Linear(model_dim, ff_dim),
-            nn.GELU(),
-            nn.Linear(ff_dim, model_dim),
-        )
-        self.norm1 = nn.LayerNorm(model_dim)
-        self.norm2 = nn.LayerNorm(model_dim)
-
-    def forward(self, x, alpha_pe, beta_pe, mask=None):
-        """
-        x: [B, N, D] 原子特征
-        alpha_pe: [B, H, N, N] 注意力权重位置编码（含高斯衰减 + 周期求和）
-        beta_pe: [B, H, N, N, K] 值向量位置编码（RBF）
-        """
-        B, N, D = x.shape
-        residual = x
-        x = self.norm1(x)
-
-        q = self.w_q(x).reshape([B, N, self.head_num, self.head_dim]).transpose([0, 2, 1, 3])
-        k = self.w_k(x).reshape([B, N, self.head_num, self.head_dim]).transpose([0, 2, 1, 3])
-        v = self.w_v(x).reshape([B, N, self.head_num, self.head_dim]).transpose([0, 2, 1, 3])
-
-        # 注意力分数 = q·k + α（伪有限周期注意力）
-        attn = paddle.matmul(q, k, transpose_y=True) / (self.head_dim ** 0.5)
-        attn = attn + alpha_pe  # 加入周期位置编码
-        if mask is not None:
-            attn = attn.masked_fill(mask == 0, float('-inf'))
-        attn = paddle.nn.functional.softmax(attn, axis=-1)
-
-        # 值向量 = v + β（周期值位置编码）
-        if self.value_pe_dist_real > 0:
-            v_pe = self.rbf_proj(beta_pe)  # [B, H, N, N, head_dim]
-            out = paddle.matmul(attn.unsqueeze(-2), (v.unsqueeze(2) + v_pe)).squeeze(-2)
-        else:
-            out = paddle.matmul(attn, v)
-
-        out = out.transpose([0, 2, 1, 3]).reshape([B, N, D])
-        out = self.w_o(out)
-        x = residual + out
-
-        # FFN
-        x = x + self.ffn(self.norm2(x))
-        return x
-
-
-class Crystalformer(nn.Layer):
-    """Crystalformer 无限连通注意力晶体性质预测模型"""
-    def __init__(self, atom_types=118, model_dim=128, ff_dim=512,
-                 num_layers=4, head_num=8, embedding_dim=128,
-                 scale_real=5.0, gauss_lb_real=0.0,
-                 value_pe_dist_real=64, value_pe_dist_max=-3.0,
-                 domain='real', loss_func='L1'):
-        super().__init__()
-        self.atom_embedding = nn.Embedding(atom_types, model_dim)
-
-        self.layers = nn.LayerList([
-            InfiniteAttentionBlock(
-                model_dim, head_num, ff_dim,
-                scale_real, gauss_lb_real, value_pe_dist_real, domain
-            ) for _ in range(num_layers)
-        ])
-
-        self.pool_norm = nn.LayerNorm(model_dim)
-        self.mlp_head = nn.Sequential(
-            nn.Linear(model_dim, embedding_dim),
-            nn.ReLU(),
-            nn.Linear(embedding_dim, 1),
-        )
-
-        if loss_func == 'L1':
-            self.loss_fn = nn.L1Loss()
-        elif loss_func == 'MSE':
-            self.loss_fn = nn.MSELoss()
-        else:
-            self.loss_fn = nn.SmoothL1Loss()
-
-    def _forward(self, atom_types, alpha_pe, beta_pe, mask=None):
-        """纯前向：原子序列 → 性质预测值"""
-        x = self.atom_embedding(atom_types)  # [B, N, D]
-        for layer in self.layers:
-            x = layer(x, alpha_pe, beta_pe, mask)
-        x = self.pool_norm(x)
-        # 全局平均池化（仅对有效原子）
-        if mask is not None:
-            x = (x * mask.unsqueeze(-1)).sum(axis=1) / mask.sum(axis=1, keepdim=True)
-        else:
-            x = x.mean(axis=1)
-        return self.mlp_head(x).squeeze(-1)
-
-    def forward(self, batch):
-        """训练入口"""
-        pred = self._forward(
-            batch['atom_types'], batch['alpha_pe'],
-            batch['beta_pe'], batch.get('mask')
-        )
-        target = batch['target']
-        loss = self.loss_fn(pred, target)
-        return {"regression_loss": loss}, {"pred": pred}
-
-    @paddle.no_grad()
-    def predict(self, batch):
-        """推理入口"""
-        pred = self._forward(
-            batch['atom_types'], batch['alpha_pe'],
-            batch['beta_pe'], batch.get('mask')
-        )
-        return {"pred": pred}
+InfiniteAttentionBlock(model_dim, head_num, ff_dim, scale_real, ...)
+  └─ forward(x, alpha_pe, beta_pe, mask) → x: Tensor[B, N, D]
 ```
 
 ### 4.3 周期位置编码计算
 
-```python
-# ppmat/models/crystalformer/periodic_encoding.py
+对每对原子 `(i, j)`，需要对所有周期镜像求和：
 
-import paddle
-import numpy as np
+- **α 编码**（注意力偏置）：`α̃_ij = log Σ_n exp(-‖p_j + Ln - p_i‖² / 2r₀²)`
+- **β 编码**（值位置编码）：`β̃_ij = Σ_n RBF(‖p_j + Ln - p_i‖) · exp(-‖...‖² / 2r₀²)`
 
-def compute_periodic_encoding(structures, scale_real, gauss_lb,
-                              value_pe_dist_real, value_pe_dist_max):
-    """
-    计算伪有限周期注意力的 α 和 β 编码。
+其中 `L` 是晶格矩阵，`n` 遍历整数平移向量。实空间在截断半径内求和，长程部分通过傅里叶空间 Ewald 求和补偿。
 
-    对于每对原子 (i, j)，计算所有周期镜像的高斯衰减求和：
-      α̃_ij = log Σ_n exp(-||p_j + Ln - p_i||² / 2r₀²)
-      β̃_ij = Σ_n RBF(||p_j + Ln - p_i||) * exp(...)
+函数签名：
 
-    其中 L 是晶格矩阵，n 遍历整数平移向量。
-    """
-    # 实空间：在截断半径内对周期镜像求和
-    # 傅里叶空间：对倒格矢做 Ewald 求和
-    ...
+```
+compute_periodic_encoding(structures, scale_real, gauss_lb,
+                          value_pe_dist_real, value_pe_dist_max)
+  → alpha_pe[B, H, N, N], beta_pe[B, H, N, N, K]
 ```
 
 ### 4.4 数据集适配
 
-```python
-# ppmat/datasets/jarvis_dataset.py
+数据源：JARVIS-DFT / Materials Project（pymatgen Structure 格式，`.pkl` 序列化）。
 
-import pickle
-import paddle
-from paddle.io import Dataset
+每条数据包含：
 
-class JARVISDataset(Dataset):
-    """JARVIS-DFT / megnet 数据集"""
-    def __init__(self, data_path, target_name, split='train'):
-        with open(f'{data_path}/{split}/raw/raw_data.pkl', 'rb') as f:
-            self.data = pickle.load(f)
-        self.target_name = target_name
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `atom_types` | int64[N] | 原子序数 |
+| `frac_coords` | float32[N, 3] | 分数坐标 |
+| `lattice` | float32[3, 3] | 晶格矩阵 |
+| `target` | float32 | 回归目标（如 formation energy） |
 
-    def __len__(self):
-        return len(self.data)
+工厂函数签名：
 
-    def __getitem__(self, idx):
-        entry = self.data[idx]
-        structure = entry['structure']  # pymatgen Structure
-
-        # 提取原子类型和坐标
-        atom_types = paddle.to_tensor(
-            [s.Z for s in structure.species], dtype='int64'
-        )
-        frac_coords = paddle.to_tensor(
-            structure.frac_coords, dtype='float32'
-        )
-        lattice = paddle.to_tensor(
-            structure.lattice.matrix, dtype='float32'
-        )
-        target = paddle.to_tensor(
-            [entry[self.target_name]], dtype='float32'
-        )
-
-        return {
-            'atom_types': atom_types,
-            'frac_coords': frac_coords,
-            'lattice': lattice,
-            'target': target,
-        }
-
-def build_jarvis(config):
-    """JARVIS 数据集工厂函数"""
-    return JARVISDataset(
-        data_path=config.data_path,
-        target_name=config.target_name,
-        split=config.get('split', 'train')
-    )
 ```
+build_jarvis(config) → JARVISDataset
+  config.data_path    — 数据目录
+  config.target_name  — 目标属性名
+  config.split        — train/val/test
+```
+
+`collate_fn` 负责将变长原子序列 padding 至 batch 内最大长度，并预计算 `alpha_pe`、`beta_pe`。
 
 ### 4.5 YAML 配置示例
 
