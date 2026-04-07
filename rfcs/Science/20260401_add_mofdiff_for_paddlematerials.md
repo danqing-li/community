@@ -199,81 +199,73 @@ PaddleMaterials/
 
 **阶段一：构建单元编码器**
 
-```python
-# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# ...
-
-import paddle
-import paddle.nn as nn
-from ppmat.utils.scatter import scatter
-
-class BBEncoder(nn.Layer):
-    """构建单元（SBU/linker）编码器 — GNN"""
-    def __init__(self, atom_fdim, hidden_dim=128, latent_dim=64, n_layers=4):
-        super().__init__()
-        self.atom_embed = nn.Linear(atom_fdim, hidden_dim)
-        self.gnn_layers = nn.LayerList([
-            nn.Linear(hidden_dim, hidden_dim) for _ in range(n_layers)
-        ])
-        self.pool = nn.Linear(hidden_dim, latent_dim)
-
-    def _forward(self, atom_features, edge_index, batch_index, n_graphs):
-        """编码单个构建单元为连续向量"""
-        h = self.atom_embed(atom_features)
-        for layer in self.gnn_layers:
-            h_msg = scatter(h[edge_index[0]], edge_index[1],
-                           dim=0, dim_size=h.shape[0], reduce="sum")
-            h = nn.functional.relu(layer(h + h_msg))
-        # 图级池化
-        graph_repr = scatter(h, batch_index, dim=0,
-                            dim_size=n_graphs, reduce="mean")
-        return self.pool(graph_repr)
-
-    def forward(self, batch):
-        """训练入口：对比学习 / 重建损失"""
-        z = self._forward(batch['atom_features'], batch['edge_index'],
-                         batch['batch_index'], batch['n_graphs'])
-        # 重建损失（decode back to atom features）
-        ...
-        return loss_dict, {"embeddings": z}
+```
+原子特征 atom_features[N, F]  +  边索引 edge_index[2, E]  +  batch_index[N]
+                               ↓
+                  BBEncoder (Message-passing GNN)
+                               ↓
+           ┌───────────────────┴───────────────────┐
+           ↓                                       ↓
+  atom_embed → GNN消息传递 (n_layers 轮)   →  scatter mean 池化
+                                                   ↓
+                                          z_bb[B, latent_dim]
 ```
 
 **阶段二：粗粒化扩散模型**
 
-```python
-class MOFDiff(nn.Layer):
-    """MOFDiff 主模型，遵循 ppmat 三层模式"""
-    def __init__(self, bb_encoder_path, latent_dim=64, hidden_dim=256,
-                 n_steps=1000):
-        super().__init__()
-        # 加载预训练 BB 编码器（冻结）
-        self.bb_encoder = BBEncoder(...)
-        self.bb_encoder.set_state_dict(paddle.load(bb_encoder_path))
-        for p in self.bb_encoder.parameters():
-            p.stop_gradient = True
+```
+预训练 BB 嵌入(冻结)    CG 位置    拓扑信息    噪声等级 σ
+  z_bb[B, D]          cg_pos     topology
+       └────────┬────────┘────────┘
+                ↓
+  ┌────────────────────────────────┐
+  │  训练阶段（Score Matching）     │
+  │                                │
+  │  σ ~ noise_schedule            │
+  │  noise ~ N(0, σ²I)            │
+  │  cg_noisy = cg_pos + noise    │
+  │                                │
+  │  pred_score = CGDenoiser(      │
+  │    cg_noisy, z_bb, topo, σ)   │
+  │  loss = ||pred_score - ∇log p||²
+  └────────────────────────────────┘
 
-        # 粗粒化扩散去噪网络
-        self.denoiser = CGDenoiser(latent_dim, hidden_dim)
-        self.n_steps = n_steps
+  ┌────────────────────────────────┐
+  │  推理阶段（迭代去噪）           │
+  │                                │
+  │  cg₀ ~ N(0, I)                │
+  │  for σ = σ_max..σ_min:        │
+  │    score = CGDenoiser(cg, z_bb, topo, σ)
+  │    cg = cg + ε·score + √(2ε)·z
+  │  → CG 结构 → BB 最近邻查表     │
+  │  → 几何放置 → CIF → UFF 弛豫   │
+  └────────────────────────────────┘
+                ↓
+     生成的 MOF 全原子结构 (CIF)
+```
 
-    def _forward(self, cg_positions, bb_embeddings, topology, sigma):
-        """纯前向：预测去噪方向"""
-        return self.denoiser(cg_positions, bb_embeddings, topology, sigma)
+#### 关键设计决策
 
-    def forward(self, batch):
-        """训练入口：扩散 score matching loss"""
-        # 噪声注入 + 去噪 → loss
-        ...
-        return loss_dict, pred_dict
+1. **两阶段训练**：先用对比学习（InfoNCE）训练 BBEncoder，再冻结后训练 CG 扩散模型
+2. **冻结 BB 编码器**：第二阶段仅优化去噪网络，`stop_gradient=True`
+3. **CG→全原子组装**：从嵌入空间最近邻查回真实 SBU/linker，几何放置后 UFF 弛豫
+4. **参考 CDVAE 框架**：扩散 loss 涵盖晶格 + 原子坐标 + 原子类型
 
-    @paddle.no_grad()
-    def predict(self, n_samples, bb_cache, conditions=None):
-        """推理入口：迭代采样 CG MOF 结构"""
-        # 从噪声迭代去噪 → CG 结构
-        ...
-        return {"cg_structures": cg_structures}
+#### 类签名
+
+```
+BBEncoder(atom_fdim, hidden_dim=128, latent_dim=64, n_layers=4)
+  ├─ _forward(atom_features, edge_index, batch_index, n_graphs)
+  │     → z_bb: Tensor[B, latent_dim]
+  └─ forward(batch) → (loss_dict, {"embeddings": z_bb})   # 对比学习训练
+
+MOFDiff(bb_encoder_path, latent_dim=64, hidden_dim=256, n_steps=1000)
+  ├─ bb_encoder: BBEncoder          ← 冻结，从 bb_encoder_path 加载
+  ├─ denoiser: CGDenoiser           ← 可训练
+  ├─ _forward(cg_positions, bb_embeddings, topology, sigma) → pred_score
+  ├─ forward(batch)                 → (loss_dict, pred_dict)   # Score matching
+  └─ predict(n_samples, bb_cache, conditions=None)
+        → {"cg_structures": [...]}
 ```
 
 ### 4.3 全原子组装流程
