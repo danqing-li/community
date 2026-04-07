@@ -160,126 +160,81 @@ PaddleMaterials/
 
 ### 4.2 模型实现
 
-核心模型遵循 PaddleMaterials 统一的 `_forward()`/`forward()`/`predict()` 三层设计：
+核心模型遵循 PaddleMaterials 统一的 `_forward()`/`forward()`/`predict()` 三层设计。
 
-```python
-# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# ...
+#### 数据流
 
-import paddle
-import paddle.nn as nn
+```
+原子坐标 pos[N, 3] + 原子类型 Z[N] + 邻居列表 edge_index
++ 可选条件 conditions（成分、温度等）
+                       ↓
+              ┌──────────────────────────┐
+              │  训练阶段（score matching） │
+              │                          │
+              │  σ ~ LogUniform(σ_min, σ_max)
+              │  noise ~ N(0, I)
+              │  pos_noisy = pos + σ · noise
+              │                          │
+              │  score = Denoiser(pos_noisy, Z, edge_index, σ, cond)
+              │                          │
+              │  loss = MSE(score, -noise/σ)  ← denoising score matching
+              └──────────────────────────┘
 
-class DM2(nn.Layer):
-    """DM2 扩散模型，遵循 ppmat 的 _forward/forward/predict 三层模式"""
-    def __init__(self, hidden_dim=128, n_layers=6, cutoff=5.0,
-                 lmax=2, sigma_min=0.01, sigma_max=10.0, n_steps=100):
-        super().__init__()
-        self.denoiser = EquivariantGNN(hidden_dim, n_layers, cutoff, lmax)
-        self.condition_encoder = ConditionEncoder(hidden_dim)
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        self.n_steps = n_steps
+              ┌──────────────────────────┐
+              │  推理阶段（Langevin 采样） │
+              │                          │
+              │  pos₀ ~ N(0, σ_max²·I)
+              │  for t = T..1:
+              │    score = Denoiser(pos_t, Z, ..., σ_t)
+              │    Δ = (σ_t² - σ_{t-1}²) · score
+              │    η = √(Δ · σ_{t-1}² / σ_t²) · N(0,I)
+              │    pos_{t-1} = pos_t + Δ + η    ← Langevin step
+              └──────────────────────────┘
+                       ↓
+              生成的非晶结构 pos_final[N, 3]
+```
 
-    def _forward(self, positions, atom_types, edge_index, sigma, conditions=None):
-        """纯前向计算：预测 score（噪声方向）"""
-        if conditions is not None:
-            cond_emb = self.condition_encoder(conditions)
-        else:
-            cond_emb = None
-        score = self.denoiser(positions, atom_types, edge_index, sigma, cond_emb)
-        return score
+#### 关键设计决策
 
-    def forward(self, positions, atom_types, edge_index, batch_index,
-                conditions=None, targets_clean=None):
-        """训练入口：score matching loss"""
-        # 采样噪声水平
-        sigma = paddle.exp(
-            paddle.uniform([positions.shape[0], 1],
-                          min=paddle.log(paddle.to_tensor(self.sigma_min)),
-                          max=paddle.log(paddle.to_tensor(self.sigma_max)))
-        )
-        # 添加噪声
-        noise = paddle.randn_like(positions)
-        noisy_positions = positions + sigma * noise
+1. **等变去噪网络**：`EquivariantGNN` 保证旋转/平移等变性，输出 score 向量与输入坐标系一致
+2. **条件生成**：`ConditionEncoder` 将成分/温度等标量条件编码为向量，注入 GNN 每层
+3. **对数均匀噪声调度**：`σ ~ exp(Uniform(log σ_min, log σ_max))`，覆盖多尺度扰动
+4. **无截断半径**：依赖邻居列表构建，截断半径由 YAML 配置控制（默认 5.0 Å）
 
-        # 预测 score
-        score = self._forward(noisy_positions, atom_types, edge_index, sigma, conditions)
+#### 类签名
 
-        # Score matching loss: ||score + noise/sigma||^2
-        target = -noise / sigma
-        loss = nn.functional.mse_loss(score, target)
-
-        pred_dict = {"score": score, "noisy_positions": noisy_positions}
-        loss_dict = {"score_matching_loss": loss}
-        return loss_dict, pred_dict
-
-    @paddle.no_grad()
-    def predict(self, atom_types, edge_index, n_atoms, conditions=None):
-        """推理入口：迭代去噪采样"""
-        # 从随机噪声开始
-        positions = paddle.randn([n_atoms, 3]) * self.sigma_max
-
-        sigmas = paddle.exp(
-            paddle.linspace(
-                paddle.log(paddle.to_tensor(self.sigma_max)),
-                paddle.log(paddle.to_tensor(self.sigma_min)),
-                self.n_steps
-            )
-        )
-
-        for i in range(self.n_steps - 1):
-            sigma = sigmas[i]
-            sigma_next = sigmas[i + 1]
-            score = self._forward(positions, atom_types, edge_index, sigma, conditions)
-            # Langevin step
-            step_size = (sigma ** 2 - sigma_next ** 2)
-            positions = positions + step_size * score
-            noise_scale = paddle.sqrt(step_size * sigma_next ** 2 / sigma ** 2)
-            positions = positions + noise_scale * paddle.randn_like(positions)
-
-        return {"generated_positions": positions}
+```
+DM2(hidden_dim=128, n_layers=6, cutoff=5.0, lmax=2,
+    sigma_min=0.01, sigma_max=10.0, n_steps=100)
+  ├─ _forward(positions, atom_types, edge_index, sigma, conditions)
+  │     → score: Tensor[N, 3]
+  ├─ forward(positions, atom_types, edge_index, batch_index, conditions, ...)
+  │     → (loss_dict, pred_dict)           # 训练入口
+  └─ predict(atom_types, edge_index, n_atoms, conditions)
+        → {"generated_positions": Tensor[N, 3]}
 ```
 
 ### 4.3 数据集适配
 
-```python
-# ppmat/datasets/amorphous_dataset.py
-import os
-import numpy as np
-import paddle
-from paddle.io import Dataset
-from ase.io import read
+数据源：非晶材料结构文件（`.xyz` / `.extxyz` 格式，ASE 读取）。
 
-class AmorphousDataset(Dataset):
-    """非晶材料数据集"""
-    def __init__(self, data_dir, cutoff=5.0, split='train'):
-        self.cutoff = cutoff
-        # 从 ASE atoms 文件加载
-        self.structures = []
-        for f in sorted(os.listdir(data_dir)):
-            if f.endswith('.xyz') or f.endswith('.extxyz'):
-                atoms = read(os.path.join(data_dir, f))
-                self.structures.append(atoms)
+每条数据包含：
 
-    def __len__(self):
-        return len(self.structures)
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `positions` | float32[N, 3] | 原子笛卡尔坐标 |
+| `atom_types` | int64[N] | 原子序数 |
 
-    def __getitem__(self, idx):
-        atoms = self.structures[idx]
-        positions = paddle.to_tensor(atoms.positions, dtype='float32')
-        atom_types = paddle.to_tensor(atoms.numbers, dtype='int64')
-        return {'positions': positions, 'atom_types': atom_types}
+工厂函数签名：
 
-def build_amorphous(config):
-    """非晶材料数据集工厂函数"""
-    return AmorphousDataset(
-        data_dir=config.data_dir,
-        cutoff=config.get('cutoff', 5.0),
-        split=config.get('split', 'train')
-    )
 ```
+build_amorphous(config) → AmorphousDataset
+  config.data_dir  — 结构文件目录
+  config.cutoff    — 邻居列表截断半径（默认 5.0）
+  config.split     — train/val/test
+```
+
+邻居列表由 `collate_fn` 在 batch 时基于 `cutoff` 动态构建。
 
 ### 4.4 训练流程
 
