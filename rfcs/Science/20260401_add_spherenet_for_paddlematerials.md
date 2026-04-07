@@ -118,155 +118,65 @@ PaddleMaterials/
 
 ### 4.2 模型实现骨架
 
-```python
-# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-import paddle
-import paddle.nn as nn
-import numpy as np
-from ppmat.utils.scatter import scatter
+#### 数据流
 
-class SphericalEmbedding(nn.Layer):
-    """球面嵌入：距离 RBF + 角度嵌入 + 二面角嵌入"""
-    def __init__(self, cutoff=10.0, n_rbf=50, n_angle=8, n_torsion=8):
-        super().__init__()
-        self.cutoff = cutoff
-        # 距离 RBF
-        self.rbf = GaussianRBF(n_rbf, 0, cutoff)
-        # 角度嵌入（可学习）
-        self.angle_embed = nn.Embedding(n_angle, n_angle)
-        # 二面角嵌入（可学习）
-        self.torsion_embed = nn.Embedding(n_torsion, n_torsion)
-    
-    def forward(self, distances, angles, torsions):
-        """
-        distances: [n_edges] 原子间距离
-        angles: [n_triplets] 键角
-        torsions: [n_quadruplets] 二面角
-        """
-        rbf_feat = self.rbf(distances)
-        # 角度离散化 + 嵌入
-        angle_bins = paddle.clip((angles / np.pi * self.angle_embed.num_embeddings).astype('int64'), 
-                                  0, self.angle_embed.num_embeddings - 1)
-        angle_feat = self.angle_embed(angle_bins)
-        # 二面角离散化 + 嵌入
-        torsion_bins = paddle.clip(((torsions + np.pi) / (2 * np.pi) * self.torsion_embed.num_embeddings).astype('int64'),
-                                    0, self.torsion_embed.num_embeddings - 1)
-        torsion_feat = self.torsion_embed(torsion_bins)
-        return rbf_feat, angle_feat, torsion_feat
+```
+原子类型 Z[N]  +  坐标 pos[N,3]  +  edge_index  +  triplet_index  +  quadruplet_index
+       ↓
+  Embedding(Z) → h[N, D]
+       ↓
+  几何特征计算：
+    distances[E]    = ||pos[j] - pos[i]||
+    angles[T]       = arccos((ji · jk)/(|ji|·|jk|))    ← 三元组 (i,j,k)
+    torsions[Q]     = dihedral(i,j,k,l)                 ← 四元组 (i,j,k,l)
+       ↓
+  SphericalEmbedding:
+    RBF(distances)         → rbf_feat[E, n_rbf]
+    bin(angles) → Embed    → angle_feat[T, n_angle]
+    bin(torsions) → Embed  → torsion_feat[Q, n_torsion]
+       ↓
+  ┌──────────────────────────────────────────────┐
+  │  SphereInteraction × n_interactions          │
+  │                                              │
+  │  msg_input = [h_i, h_j, h_k,                │
+  │               rbf, angle, torsion]           │ ← 四元组消息
+  │  messages = MLP(msg_input)                   │
+  │  agg = scatter_sum(messages, center_j)       │
+  │  h = h + MLP(agg)                           │ ← 残差更新
+  └──────────────────────────────────────────────┘
+       ↓
+  output = MLP(h).squeeze(-1)   → 分子/晶体属性预测
+       ↓
+  loss = MSE(output, targets)
+```
 
-class SphereInteraction(nn.Layer):
-    """球面消息传递交互层"""
-    def __init__(self, hidden_dim=128, n_rbf=50, n_angle=8, n_torsion=8):
-        super().__init__()
-        # 消息网络（距离 + 角度 + 二面角）
-        self.message_net = nn.Sequential(
-            nn.Linear(hidden_dim * 3 + n_rbf + n_angle + n_torsion, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU()
-        )
-        # 原子更新
-        self.atom_update = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-    
-    def forward(self, atom_features, edge_index, triplet_index, quadruplet_index,
-                rbf_feat, angle_feat, torsion_feat):
-        """
-        triplet_index: [n_triplets, 3] — (i, j, k) 原子索引
-        quadruplet_index: [n_quadruplets, 4] — (i, j, k, l) 原子索引
-        """
-        # 消息生成（基于四元组）
-        h_i = atom_features[quadruplet_index[:, 0]]
-        h_j = atom_features[quadruplet_index[:, 1]]
-        h_k = atom_features[quadruplet_index[:, 2]]
-        
-        message_input = paddle.concat([h_i, h_j, h_k, rbf_feat, angle_feat, torsion_feat], axis=-1)
-        messages = self.message_net(message_input)
-        
-        # 消息聚合（按中心原子 j 聚合）
-        n_atoms = atom_features.shape[0]
-        aggregated = scatter(messages, quadruplet_index[:, 1], dim=0, dim_size=n_atoms, reduce="sum")
-        
-        # 原子更新（residual 连接）
-        new_features = atom_features + self.atom_update(aggregated)
-        return new_features
+#### 关键设计决策
 
-class SphereNet(nn.Layer):
-    """SphereNet 主模型"""
-    def __init__(self, hidden_dim=128, n_interactions=4, cutoff=10.0,
-                 n_rbf=50, n_angle=8, n_torsion=8, max_z=100):
-        super().__init__()
-        self.embedding = nn.Embedding(max_z, hidden_dim, padding_idx=0)
-        self.spherical_embedding = SphericalEmbedding(cutoff, n_rbf, n_angle, n_torsion)
-        self.interactions = nn.LayerList([
-            SphereInteraction(hidden_dim, n_rbf, n_angle, n_torsion)
-            for _ in range(n_interactions)
-        ])
-        self.output_layer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-    
-    def _forward(self, atom_types, positions, edge_index, triplet_index, quadruplet_index):
-        """纯前向计算"""
-        # 原子嵌入
-        h = self.embedding(atom_types)
-        
-        # 几何特征计算
-        distances = self._compute_distances(positions, edge_index)
-        angles = self._compute_angles(positions, triplet_index)
-        torsions = self._compute_torsions(positions, quadruplet_index)
-        
-        # 球面嵌入
-        rbf_feat, angle_feat, torsion_feat = self.spherical_embedding(distances, angles, torsions)
-        
-        # T 层球面交互
-        for interaction in self.interactions:
-            h = interaction(h, edge_index, triplet_index, quadruplet_index,
-                           rbf_feat, angle_feat, torsion_feat)
-        
-        # 输出（分子属性）
-        output = self.output_layer(h).squeeze(-1)
-        return output
-    
-    def forward(self, batch, return_loss=True, return_prediction=True):
-        """训练入口，返回 (loss_dict, pred_dict)"""
-        pred = self._forward(
-            batch['atom_types'], batch['positions'], 
-            batch['edge_index'], batch['triplet_index'], batch['quadruplet_index']
-        )
-        
-        pred_dict = {"prediction": pred}
-        loss_dict = {}
-        
-        if return_loss and 'targets' in batch:
-            loss = nn.functional.mse_loss(pred, batch['targets'])
-            loss_dict["mse_loss"] = loss
-        
-        return loss_dict, pred_dict
-    
-    def _compute_distances(self, positions, edge_index):
-        """计算原子间距离"""
-        return paddle.norm(positions[edge_index[:, 1]] - positions[edge_index[:, 0]], axis=-1)
-    
-    def _compute_angles(self, positions, triplet_index):
-        """计算键角（i-j-k）"""
-        vec_ji = positions[triplet_index[:, 0]] - positions[triplet_index[:, 1]]
-        vec_jk = positions[triplet_index[:, 2]] - positions[triplet_index[:, 1]]
-        # cos(θ) = (ji · jk) / (|ji| * |jk|)
-        cos_angle = paddle.sum(vec_ji * vec_jk, axis=-1) / (
-            paddle.norm(vec_ji, axis=-1) * paddle.norm(vec_jk, axis=-1) + 1e-8
-        )
-        return paddle.acos(paddle.clip(cos_angle, -1.0, 1.0))
-    
-    def _compute_torsions(self, positions, quadruplet_index):
-        """计算二面角（i-j-k-l）"""
-        # 实现略（参考原论文公式）
-        ...
+1. **三重几何特征**：同时使用距离（RBF）+ 键角（角度嵌入）+ 二面角（扭转嵌入），完整描述 3D 球面几何
+2. **四元组消息传递**：消息基于 (i,j,k,l) 四元组构建，而非仅 (i,j) 边对，捕获更高阶结构信息
+3. **可学习角度/扭转嵌入**：角度和二面角先离散化为 bin 索引，再通过 `nn.Embedding` 查表，可端到端优化
+4. **scatter 聚合复用**：复用 ppmat 已有的 `scatter` 工具，按中心原子 j 聚合四元组消息
+
+#### 类签名
+
+```
+SphericalEmbedding(cutoff=10.0, n_rbf=50, n_angle=8, n_torsion=8)
+  └─ forward(distances, angles, torsions)
+        → (rbf_feat, angle_feat, torsion_feat)
+
+SphereInteraction(hidden_dim=128, n_rbf=50, n_angle=8, n_torsion=8)
+  └─ forward(atom_features, edge_index, triplet_index, quadruplet_index,
+             rbf_feat, angle_feat, torsion_feat)
+        → new_atom_features: Tensor[N, D]
+
+SphereNet(hidden_dim=128, n_interactions=4, cutoff=10.0,
+          n_rbf=50, n_angle=8, n_torsion=8, max_z=100)
+  ├─ spherical_embedding: SphericalEmbedding
+  ├─ interactions: [SphereInteraction] × n_interactions
+  ├─ _forward(atom_types, positions, edge_index,
+  │           triplet_index, quadruplet_index) → output: Tensor[N]
+  ├─ forward(batch) → (loss_dict, pred_dict)          # 训练入口
+  └─ 内部方法：_compute_distances(), _compute_angles(), _compute_torsions()
 ```
 
 ## 5. 测试和验收的考量
